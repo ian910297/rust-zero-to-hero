@@ -1,45 +1,126 @@
-// for .read
-use std::io::prelude::*;
-// for html files
-use std::fs;
-use std::net::TcpListener;
-use std::net::TcpStream;
+#[macro_use]
+extern crate actix_web;
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:9527").unwrap();
+use std::{env, io};
 
-    for stream in listener.incoming() {
-        let stream = stream.unwrap();
+use actix_files as fs;
+use actix_session::{CookieSession, Session};
+use actix_utils::mpsc;
+use actix_web::http::{header, Method, StatusCode};
+use actix_web::{
+    error, guard, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer,
+    Result,
+};
+use bytes::Bytes;
 
-        // println!("Connection established!");
-        handle_connection(stream);
-    }
+/// favicon handler
+#[get("/favicon")]
+async fn favicon() -> Result<fs::NamedFile> {
+    Ok(fs::NamedFile::open("www/favicon.ico")?)
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let mut line;
-    loop {
-        line = [0; 512];
-        let result = stream.read(&mut line);
-        // println!("{}", result.unwrap());
-        match result {
-            Ok(n) => {
-                println!("Request: {}", String::from_utf8_lossy(&line[..]));
-                println!("Received {} bytes", n);
-                if n < 512 {
-                    break;
-                }
-            },
-            _ => {
-                println!("here");
-            },
-        }
+/// simple index handler
+#[get("/")]
+async fn index(session: Session, req: HttpRequest) -> Result<HttpResponse> {
+    println!("{:?}", req);
+
+    // session
+    let mut counter = 1;
+    if let Some(count) = session.get::<i32>("counter")? {
+        println!("SESSION value: {}", count);
+        counter = count + 1;
     }
 
-    let contents = fs::read_to_string("www/index.html").unwrap();
-    let response = format!("HTTP/1.1 200 OK\r\n\r\n{}", contents);
-    
-    // println!("{}", contents);
-    stream.write(response.as_bytes()).unwrap();
-    stream.flush().unwrap();
+    // set counter to session
+    session.set("counter", counter)?;
+
+    // response
+    Ok(HttpResponse::build(StatusCode::OK)
+        .content_type("text/html; charset=utf-8")
+        .body(include_str!("../www/index.html")))
+}
+
+/// 404 handler
+async fn p404() -> Result<fs::NamedFile> {
+    Ok(fs::NamedFile::open("www/404.html")?.set_status_code(StatusCode::NOT_FOUND))
+}
+
+/// response body
+async fn response_body(path: web::Path<String>) -> HttpResponse {
+    let text = format!("Hello {}!", *path);
+
+    let (tx, rx_body) = mpsc::channel();
+    let _ = tx.send(Ok::<_, Error>(Bytes::from(text)));
+
+    HttpResponse::Ok().streaming(rx_body)
+}
+
+/// handler with path parameters like `/user/{name}/`
+async fn with_param(req: HttpRequest, path: web::Path<(String,)>) -> HttpResponse {
+    println!("{:?}", req);
+
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(format!("Hello {}!", path.0))
+}
+
+#[actix_rt::main]
+async fn main() -> io::Result<()> {
+    env::set_var("RUST_LOG", "actix_web=debug,actix_server=info");
+    env_logger::init();
+
+    HttpServer::new(|| {
+        App::new()
+            // cookie session middleware
+            .wrap(CookieSession::signed(&[0; 32]).secure(false))
+            // enable logger - always register actix-web Logger middleware last
+            .wrap(middleware::Logger::default())
+            // register favicon
+            .service(favicon)
+            // register simple route, handle all methods
+            .service(index)
+            // with path parameters
+            .service(web::resource("/user/{name}").route(web::get().to(with_param)))
+            // async response body
+            .service(
+                web::resource("/async-body/{name}").route(web::get().to(response_body)),
+            )
+            .service(
+                web::resource("/test").to(|req: HttpRequest| match *req.method() {
+                    Method::GET => HttpResponse::Ok(),
+                    Method::POST => HttpResponse::MethodNotAllowed(),
+                    _ => HttpResponse::NotFound(),
+                }),
+            )
+            .service(web::resource("/error").to(|| async {
+                error::InternalError::new(
+                    io::Error::new(io::ErrorKind::Other, "test"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            }))
+            // www files
+            .service(fs::Files::new("/www", "www").show_files_listing())
+            // redirect
+            .service(web::resource("/").route(web::get().to(|req: HttpRequest| {
+                println!("{:?}", req);
+                HttpResponse::Found()
+                    .header(header::LOCATION, "/")
+                    .finish()
+            })))
+            // default
+            .default_service(
+                // 404 for GET request
+                web::resource("")
+                    .route(web::get().to(p404))
+                    // all requests that are not `GET`
+                    .route(
+                        web::route()
+                            .guard(guard::Not(guard::Get()))
+                            .to(HttpResponse::MethodNotAllowed),
+                    ),
+            )
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await
 }
